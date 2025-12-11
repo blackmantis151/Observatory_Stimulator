@@ -24,8 +24,8 @@ class ALTSubsystem(SubsystemBase):
         super().__init__("ALT")
 
         # --- canonical position variables expected by SubsystemBase/SCC ---
-        self.current_pos_deg = 45.0       # initial altitude
-        self.target_pos_deg = 45.0
+        self.current_pos_deg = 0.0       # initial altitude
+        self.target_pos_deg = 0.0
 
         # Legacy alias if anything still uses current_pos
         self.current_pos = self.current_pos_deg
