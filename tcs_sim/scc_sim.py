@@ -20,7 +20,7 @@ import pandas as pd
 from bus_config import HEARTBEAT_ENDPOINT, SCC_TO_TCS_ENDPOINT, now_ts, log
 
 # CSV log path
-LOG_CSV = "/home/harshit/Observatory_Stimulator/Observatory_Stimulator/tcs_sim/scc_log.csv"
+LOG_CSV = "./scc_log.csv"
 
 
 class SCCSimulator:
