@@ -8,6 +8,9 @@ from alt_sim import ALTSubsystem
 from az_sim import AZSubsystem
 from cas_sim import CASSubsystem
 from scc_sim import SCCSimulator
+from amn_sim import AMNSubsystem
+from enc_sim import ENCSubsystem
+
 
 
 def live_sky_plot(alt_obj, az_obj):
@@ -74,12 +77,17 @@ if __name__ == "__main__":
     az  = AZSubsystem()
     cas = CASSubsystem()
     scc = SCCSimulator()
+    amn = AMNSubsystem()
+    enc = ENCSubsystem()
+
 
     threads = [
         threading.Thread(target=alt.run, daemon=True),
         threading.Thread(target=az.run,  daemon=True),
         threading.Thread(target=cas.run, daemon=True),
         threading.Thread(target=scc.run, daemon=True),
+        threading.Thread(target=amn.run, daemon=True),
+        threading.Thread(target=enc.run, daemon=True),
     ]
 
     for t in threads:
