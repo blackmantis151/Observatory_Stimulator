@@ -33,6 +33,9 @@ class CASSubsystem(SubsystemBase):
 
         self.command_table = {
             "CAS": self._cmd_CAS,
+            "UNWRAP_CAS": self._cmd_UNWRAP_CAS,
+            "STOP":     self._cmd_STOP,
+            
         }
 
     # ----------------------------------------------------
@@ -146,6 +149,55 @@ class CASSubsystem(SubsystemBase):
             return
 
         log("CAS", f"Accepted CAS {angle:.3f}")
+        
+    def _cmd_UNWRAP_CAS(self, cmd_id, params):
+        self.send_result("ACK", cmd_id=cmd_id)
+
+        x = self.current_pos_deg
+        min_lim, max_lim = -180, 360
+
+        forward_ok = x + 360 <= max_lim
+        backward_ok = x - 360 >= min_lim
+
+        if not (forward_ok or backward_ok):
+            self._set_error("BADRANGE")
+            self.send_result("ERROR", cmd_id=cmd_id, error_code="BADRANGE")
+            return
+
+        target = x + 360 if forward_ok else x - 360
+
+        res = self._start_move(target, timeout_s=220)
+        if res["status"] == "ERROR":
+            self.send_result("ERROR", cmd_id=cmd_id, error_code=res["error"])
+            return
+
+        log("CAS", f"UNWRAP → {target:.3f}")
+        
+        
+    def _cmd_STOP(self, cmd_id, params):
+        """
+        Handler for STOP on CAS mechanism.
+
+        TCS sends on CAS bus:
+            {"command": "STOP", "params": {"mechanism": "CAS"}}
+        """
+
+        mech = (params.get("mechanism") or "").upper()
+        if mech not in ("", "CAS"):
+            log("CAS", f"STOP received with unexpected mechanism '{mech}', treating as CAS")
+
+        # signal motion loop to halt
+        self._motion_stop = True
+
+        # if no motion, just enforce STOPPED
+        if not (self._motion_thread and self._motion_thread.is_alive()):
+            self.state = "STOPPED"
+            self.last_error = "OK"
+            self.send_status()
+
+        # ACK STOP
+        self.send_result("ACK", cmd_id=cmd_id)
+
 
     # ----------------------------------------------------
     def handle_command(self, msg):

@@ -34,6 +34,7 @@ class AZSubsystem(SubsystemBase):
         self.command_table = {
             "AZIMUTH": self._cmd_AZIMUTH,
             "UNWRAP_AZ": self._cmd_UNWRAP_AZ,
+            "STOP":     self._cmd_STOP,    # STOP ALT
         }
 
     # ----------------------------------------------------
@@ -179,6 +180,33 @@ class AZSubsystem(SubsystemBase):
             return
 
         log("AZ", f"UNWRAP → {target:.3f}")
+        
+        
+        
+    def _cmd_STOP(self, cmd_id, params):
+        """
+        Handler for STOP on AZ mechanism.
+
+        TCS sends on AZ bus:
+            {"command": "STOP", "params": {"mechanism": "AZ"}}
+        """
+
+        mech = (params.get("mechanism") or "").upper()
+        if mech not in ("", "AZ"):
+            log("AZ", f"STOP received with unexpected mechanism '{mech}', treating as AZ")
+
+        # signal motion loop to halt
+        self._motion_stop = True
+
+        # if no motion, just enforce STOPPED
+        if not (self._motion_thread and self._motion_thread.is_alive()):
+            self.state = "STOPPED"
+            self.last_error = "OK"
+            self.send_status()
+
+        # ACK STOP
+        self.send_result("ACK", cmd_id=cmd_id)
+
 
     # ----------------------------------------------------
     def handle_command(self, msg):
