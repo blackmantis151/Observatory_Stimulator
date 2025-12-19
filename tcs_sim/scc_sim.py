@@ -34,7 +34,7 @@ class SCCSimulator:
 
         # SCC to TCS publisher
         self.scc_pub = self.ctx.socket(zmq.PUB)
-        self.scc_pub.bind(SCC_TO_TCS_ENDPOINT)
+        self.scc_pub.connect(SCC_TO_TCS_ENDPOINT)
 
         # Live state of subsystems in memory
         # name -> { "state": str, "last_heartbeat": int, "current_pos_deg": float }

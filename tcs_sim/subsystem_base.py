@@ -113,13 +113,17 @@ class SubsystemBase:
     # ---------- To be overridden ----------
 
     def handle_command(self, msg: dict):
-        """
-        Default implementation: just report an error.
-
-        Subclasses must override this to implement real commands.
-        """
         cmd_id = msg.get("cmd_id")
-        self.send_result("ERROR", cmd_id=cmd_id, error_code="UNIMPLEMENTED_SUBSYSTEM")
+        command = (msg.get("command") or "").upper()
+        params = msg.get("params", {}) or {}
+
+        handler = getattr(self, "command_table", {}).get(command)
+        if not handler:
+            self.send_result("ERROR", cmd_id=cmd_id, error_code="NETUNK")
+            log(self.name, f"Unknown command '{command}'")
+            return
+
+        handler(cmd_id, params)
 
     # ---------- Main loop ----------
 
