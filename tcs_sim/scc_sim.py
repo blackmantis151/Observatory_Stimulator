@@ -20,7 +20,7 @@ import pandas as pd
 from bus_config import HEARTBEAT_ENDPOINT, SCC_TO_TCS_ENDPOINT, now_ts, log
 
 # CSV log path
-LOG_CSV = "/home/harshit/Observatory_Stimulator/Observatory_Stimulator/tcs_sim/scc_log.csv"
+LOG_CSV = "/home/baff/Documents/Girawali/Observatory_Stimulator/tcs_sim/scc_log.csv"
 
 
 class SCCSimulator:
@@ -34,7 +34,7 @@ class SCCSimulator:
 
         # SCC to TCS publisher
         self.scc_pub = self.ctx.socket(zmq.PUB)
-        self.scc_pub.bind(SCC_TO_TCS_ENDPOINT)
+        self.scc_pub.connect(SCC_TO_TCS_ENDPOINT)
 
         # Live state of subsystems in memory
         # name -> { "state": str, "last_heartbeat": int, "current_pos_deg": float }
