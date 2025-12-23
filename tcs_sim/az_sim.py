@@ -1,57 +1,160 @@
-# az_sim.py — FINAL corrected version for TCS core
-
 import threading
 import time
+import json
+import numpy as np  # Needed for physics limits
+
 from subsystem_base import SubsystemBase
 from bus_config import log
 
+# --- CONFIGURATION ---
+MAX_VEL = 2.0       # deg/s
+MAX_ACCEL = 0.3     # deg/s^2
+DT = 0.1            # 10Hz Physics Loop
+TOLERANCE = 0.05    # Degrees for "Target Reached"
 
 class AZSubsystem(SubsystemBase):
     """
-    Simulated AZ axis
-    Commands supported:
-        AZIMUTH  angle
-        UNWRAP_AZ
-    Valid range: -180 to +360
+    Simulated AZ axis.
+    Supports:
+      1. Legacy Point-to-Point (AZIMUTH, UNWRAP_AZ commands)
+      2. New Trajectory Tracking (GOTO command)
     """
 
     def __init__(self):
         super().__init__("AZ")
 
-        self.current_pos_deg = 0.0
-        self.target_pos_deg = 0.0
-        self.current_pos = self.current_pos_deg
-
+        # --- Legacy State Variables ---
         self.state = "STOPPED"
         self.last_error = "OK"
 
+        # --- Motion Parameters ---
         self.vel_limit_deg_s = 2.0
         self.sim_speed = 1.0
 
+        # --- Thread Control ---
         self._motion_thread = None
         self._motion_stop = False
+        
+        # --- NEW: Trajectory Control Flags ---
+        self.tracking_active = False
+        self.active_cmd_id = None
+        self.target_reached_flag = False
+        self.current_vel = 0.0
 
+        # --- Command Table ---
         self.command_table = {
-            "AZIMUTH": self._cmd_AZIMUTH,
-            "UNWRAP_AZ": self._cmd_UNWRAP_AZ,
-            "STOP":     self._cmd_STOP,    # STOP ALT
+            "AZIMUTH":    self._cmd_AZIMUTH,
+            "UNWRAP_AZ":  self._cmd_UNWRAP_AZ,
+            "STOP":       self._cmd_STOP,
+            "GOTO":       self._cmd_GOTO,    # <--- NEW
+            "GOTOF":      self._cmd_GOTO,
         }
 
-    # ----------------------------------------------------
-    def _set_error(self, code):
-        self.last_error = code
-        self.state = "ERROR"
+        # --- NEW: Start Physics Thread (Always runs in background) ---
+        self.physics_thread = threading.Thread(target=self._physics_loop, daemon=True)
+        self.physics_thread.start()
 
-    def _reject_if_blocked(self):
-        if self.state in ("OFF-LINE", "OVERRIDE", "UNKNOWN"):
-            self._set_error("STATEREJECT")
-            return "STATEREJECT"
-        return None
+    # ============================================================
+    # NEW: Trajectory Command Handler (GOTO)
+    # ============================================================
+    def _cmd_GOTO(self, cmd_id, params):
+        """
+        Handles incoming JSON trajectory packets.
+        Expected params: {'timestamp': [t1...], 'position': [p1...]}
+        """
+        # 1. Stop Legacy Motion (if running)
+        self._motion_stop = True
+        if self._motion_thread and self._motion_thread.is_alive():
+            self._motion_thread.join(timeout=0.2)
+        
+        self.state = "TRACKING" 
+        
+        # 2. Send ACK
+        self.send_result("ACK", cmd_id=cmd_id)
 
-    # ----------------------------------------------------
-    # Motion engine (same pattern as ALT)
-    # ----------------------------------------------------
-    def _start_move(self, target_deg, timeout_s):
+        # 3. Append Data
+        timestamps = params.get('timestamp')
+        positions = params.get('position')
+        
+        if timestamps and positions:
+            success = self.append_trajectory_data(timestamps, positions)
+            if success:
+                # 4. Activate Physics Loop
+                self.active_cmd_id = cmd_id
+                self.target_reached_flag = False 
+                self.tracking_active = True
+                log("AZ", f"GOTO (Trajectory) Mode ACTIVATED for ID {cmd_id}")
+            else:
+                self.send_result("ERROR", cmd_id=cmd_id, error="FILE_WRITE_FAIL")
+        else:
+            self.send_result("ERROR", cmd_id=cmd_id, error="BAD_DATA")
+
+    # ============================================================
+    # NEW: Physics Loop (The "Brain" for Trajectory)
+    # ============================================================
+    def _physics_loop(self):
+        log("AZ", "Physics Thread Started")
+        
+        while self.running:
+            start_time = time.time()
+            
+            # ONLY run physics if we are in Trajectory Mode
+            if self.tracking_active:
+                # 1. Get Target from Base Class
+                target = self.get_interpolated_target(start_time)
+                # Hold last known target if data ends
+                if target is not None:
+                    self.target_pos_deg = target
+                
+                if target is not None:
+                    # 2. Calculate Error (With Wrap Logic)
+                    error = target - self.current_pos_deg
+                    
+                    # --- AZIMUTH WRAP LOGIC (Shortest Path) ---
+                    # If error > 180, go the other way (subtract 360)
+                    # If error < -180, go the other way (add 360)
+                    if error > 180:
+                        error -= 360
+                    elif error < -180:
+                        error += 360
+                    
+                    # 3. Calculate Physics (P-Control + Limits)
+                    cmd_vel = np.clip(error * 1.5, -MAX_VEL, MAX_VEL)
+                    
+                    delta_v = cmd_vel - self.current_vel
+                    delta_v = np.clip(delta_v, -MAX_ACCEL * DT, MAX_ACCEL * DT)
+                    
+                    self.current_vel += delta_v
+                    self.current_pos_deg += self.current_vel * DT
+                    
+                    # Normalize Azimuth to 0-360 range for display
+                    self.current_pos_deg = self.current_pos_deg % 360
+                    
+                    # Update Legacy Alias
+                    self.current_pos = self.current_pos_deg
+
+                    # 4. Check Completion
+                    if abs(error) < TOLERANCE and not self.target_reached_flag:
+                        self.target_reached_flag = True
+                        if self.active_cmd_id:
+                            self.send_result("COMPLETED", cmd_id=self.active_cmd_id, msg="Target Reached")
+                        self.state = "TRACKING"
+
+                    # 5. Log & Report (Status Bus)
+                    self.log_current_state_to_disk(start_time, self.current_pos_deg)
+                    self.send_status(cmd_id=self.active_cmd_id, error=error)
+                
+            # Timing (Maintain 10Hz)
+            elapsed = time.time() - start_time
+            time.sleep(max(0, DT - elapsed))
+
+    # ============================================================
+    # EXISTING: Legacy Motion Engine (Modified for Safety)
+    # ============================================================
+    def _start_move(self, target_deg: float, timeout_s: float):
+        # --- SAFETY: Disable Trajectory Mode ---
+        self.tracking_active = False 
+        self.active_cmd_id = None
 
         if self._motion_thread and self._motion_thread.is_alive():
             self._motion_stop = True
@@ -84,11 +187,10 @@ class AZSubsystem(SubsystemBase):
             self.state = "MOVING"
             t0 = time.time()
             last = t0
-
             self.send_status()
 
             while True:
-                if self._motion_stop or not self.running:
+                if self._motion_stop or not self.running or self.tracking_active:
                     self.state = "STOPPED"
                     self.send_status()
                     return
@@ -109,6 +211,7 @@ class AZSubsystem(SubsystemBase):
                 self.current_pos_deg += step
                 self.current_pos = self.current_pos_deg
 
+                # Check for overshoot (Simple clamp)
                 if direction > 0 and self.current_pos_deg > target_deg:
                     self.current_pos_deg = target_deg
                 if direction < 0 and self.current_pos_deg < target_deg:
@@ -122,17 +225,26 @@ class AZSubsystem(SubsystemBase):
 
         return {"status": "OK", "error": "OK"}
 
-    # ----------------------------------------------------
+    # ============================================================
+    # EXISTING: Helpers & Handlers
+    # ============================================================
+    def _set_error(self, code):
+        self.last_error = code
+        self.state = "ERROR"
+
+    def _reject_if_blocked(self):
+        if self.state in ("OFF-LINE", "OVERRIDE", "UNKNOWN"):
+            self._set_error("STATEREJECT")
+            return "STATEREJECT"
+        return None
+
     def _cmd_AZIMUTH(self, cmd_id, params):
-
         self.send_result("ACK", cmd_id=cmd_id)
-
         angle_raw = params.get("angle")
         if angle_raw is None:
             self._set_error("BADPARAM")
             self.send_result("ERROR", cmd_id=cmd_id, error_code="BADPARAM")
             return
-
         try:
             angle = float(angle_raw)
         except:
@@ -140,6 +252,7 @@ class AZSubsystem(SubsystemBase):
             self.send_result("ERROR", cmd_id=cmd_id, error_code="BADPARAM")
             return
 
+        # Legacy limit check (might differ from wrap logic, keeping original)
         if angle < -180 or angle > 360:
             self._set_error("BADRANGE")
             self.send_result("ERROR", cmd_id=cmd_id, error_code="BADRANGE")
@@ -154,16 +267,12 @@ class AZSubsystem(SubsystemBase):
         if res["status"] == "ERROR":
             self.send_result("ERROR", cmd_id=cmd_id, error_code=res["error"])
             return
-
         log("AZ", f"Accepted AZIMUTH {angle:.3f}")
 
-    # ----------------------------------------------------
     def _cmd_UNWRAP_AZ(self, cmd_id, params):
         self.send_result("ACK", cmd_id=cmd_id)
-
         x = self.current_pos_deg
         min_lim, max_lim = -180, 360
-
         forward_ok = x + 360 <= max_lim
         backward_ok = x - 360 >= min_lim
 
@@ -171,44 +280,28 @@ class AZSubsystem(SubsystemBase):
             self._set_error("BADRANGE")
             self.send_result("ERROR", cmd_id=cmd_id, error_code="BADRANGE")
             return
-
         target = x + 360 if forward_ok else x - 360
-
         res = self._start_move(target, timeout_s=220)
         if res["status"] == "ERROR":
             self.send_result("ERROR", cmd_id=cmd_id, error_code=res["error"])
             return
-
         log("AZ", f"UNWRAP → {target:.3f}")
         
-        
-        
     def _cmd_STOP(self, cmd_id, params):
-        """
-        Handler for STOP on AZ mechanism.
-
-        TCS sends on AZ bus:
-            {"command": "STOP", "params": {"mechanism": "AZ"}}
-        """
-
+        # Legacy STOP disables Trajectory
+        self.tracking_active = False 
+        
         mech = (params.get("mechanism") or "").upper()
         if mech not in ("", "AZ"):
             log("AZ", f"STOP received with unexpected mechanism '{mech}', treating as AZ")
 
-        # signal motion loop to halt
         self._motion_stop = True
-
-        # if no motion, just enforce STOPPED
         if not (self._motion_thread and self._motion_thread.is_alive()):
             self.state = "STOPPED"
             self.last_error = "OK"
             self.send_status()
-
-        # ACK STOP
         self.send_result("ACK", cmd_id=cmd_id)
 
-
-    # ----------------------------------------------------
     def handle_command(self, msg):
         cmd_id = msg.get("cmd_id")
         cmd = (msg.get("command") or "").upper()
@@ -218,5 +311,8 @@ class AZSubsystem(SubsystemBase):
         if not f:
             self.send_result("ERROR", cmd_id=cmd_id, error_code="NETUNK")
             return
-
         f(cmd_id, params)
+
+if __name__ == "__main__":
+    sys = AZSubsystem()
+    sys.run()
