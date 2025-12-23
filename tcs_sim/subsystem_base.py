@@ -1,8 +1,12 @@
 import time
 import json
 import threading
-
+import pandas as pd
+import numpy as np
+import csv
+import os
 import zmq
+
 
 from bus_config import (
     CMD_ENDPOINT,
@@ -31,10 +35,18 @@ class SubsystemBase:
     def __init__(self, name: str):
         self.name = name.upper()
         self.running = True
+        
+        # --- NEW: File Paths & Thread Safety ---
+        self.traj_file = f"trajectory_{self.name.lower()}.csv"
+        self.status_file = f"status_{self.name.lower()}.csv"
+        self.data_lock = threading.Lock()
 
+        # --- NEW: Initialize Files & Recover State ---
+        self._init_files()
+        
         # Generic state; subclasses can use/extend
         self.state = "IDLE"
-        self.current_pos_deg = 0.0
+        self.current_pos_deg = self._recover_last_position() # <--- CHANGED FROM 0.0
         self.target_pos_deg = 0.0
 
         self.ctx = zmq.Context.instance()
@@ -102,6 +114,103 @@ class SubsystemBase:
         self.hb_pub.send_string(topic, flags=zmq.SNDMORE)
         self.hb_pub.send_string(json.dumps(body))
         # log(self.name, f"SENT HB on {topic}: {body}")
+        
+        
+        
+    # ---------- File & Math Helpers (NEW) ----------
+
+    def _init_files(self):
+        """Ensures CSV files exist with correct headers."""
+        # Trajectory File
+        if not os.path.exists(self.traj_file):
+            with open(self.traj_file, 'w', newline='') as f:
+                csv.writer(f).writerow(['timestamp', 'position'])
+        
+        # Status File (Append-only)
+        if not os.path.exists(self.status_file):
+            with open(self.status_file, 'w', newline='') as f:
+                csv.writer(f).writerow(['timestamp', 'position'])
+
+    def _recover_last_position(self):
+        """Reads the last line of the status CSV to recover state on restart."""
+        default_pos = 90.0 if self.name == 'ALT' else 0.0
+        
+        if not os.path.exists(self.status_file):
+            return default_pos
+
+        try:
+            with open(self.status_file, "r") as f:
+                # Efficiently seek to the end
+                f.seek(0, os.SEEK_END)
+                if f.tell() < 5: return default_pos # Empty file check
+                
+                pos = f.tell() - 2
+                while pos > 0 and f.read(1) != "\n":
+                    pos -= 1
+                    f.seek(pos, os.SEEK_SET)
+                last_line = f.readline().strip()
+                
+                parts = last_line.split(',')
+                if len(parts) >= 2 and parts[0].replace('.','',1).isdigit():
+                    recovered = float(parts[1])
+                    log(self.name, f"Recovered Position from Disk: {recovered}")
+                    return recovered
+        except Exception as e:
+            log(self.name, f"Error recovering state: {e}")
+        
+        return default_pos
+
+    def append_trajectory_data(self, timestamps, positions):
+        """Thread-safe method to append new trajectory packets."""
+        try:
+            with self.data_lock:
+                with open(self.traj_file, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    for t, p in zip(timestamps, positions):
+                        writer.writerow([t, p])
+            return True
+        except Exception as e:
+            log(self.name, f"Error appending trajectory: {e}")
+            return False
+
+    def log_current_state_to_disk(self, timestamp, position):
+        """Persist status to CSV (Distinct from network send_status)."""
+        try:
+            with open(self.status_file, 'a', newline='') as f:
+                csv.writer(f).writerow([f"{timestamp:.3f}", f"{position:.4f}"])
+        except Exception:
+            pass 
+
+    def get_interpolated_target(self, query_time):
+        """Reads trajectory CSV and returns the target position for Time T."""
+        try:
+            with self.data_lock:
+                # Note: In high-performance scenarios, cache the DataFrame in memory
+                if not os.path.exists(self.traj_file): return None
+                df = pd.read_csv(self.traj_file)
+            
+            times = df['timestamp'].values
+            if len(times) == 0: return None
+            
+            # Binary search
+            idx = np.searchsorted(times, query_time)
+            
+            # Boundary checks
+            if idx == 0: return df.iloc[0]['position']
+            if idx >= len(times): return df.iloc[-1]['position']
+            
+            # Linear Interpolation
+            t1, t2 = times[idx-1], times[idx]
+            p1, p2 = df.iloc[idx-1]['position'], df.iloc[idx]['position']
+            
+            if t2 - t1 == 0: return p1
+            
+            fraction = (query_time - t1) / (t2 - t1)
+            target = p1 + (p2 - p1) * fraction
+            return target
+            
+        except Exception:
+            return None
 
     # ---------- Background loops ----------
 
