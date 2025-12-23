@@ -1,76 +1,151 @@
-# alt_sim.py — corrected and synchronised with TCS core
-
 import threading
 import time
+import json
+import numpy as np  # Needed for physics limits
 
 from subsystem_base import SubsystemBase
 from bus_config import log
 
+# --- CONFIGURATION ---
+MAX_VEL = 2.0       # deg/s
+MAX_ACCEL = 0.3     # deg/s^2
+DT = 0.1            # 10Hz Physics Loop
+TOLERANCE = 0.05    # Degrees for "Target Reached"
 
 class ALTSubsystem(SubsystemBase):
     """
-    Simulated ALT axis (mechanism control).
-
-    Implements the TTL-like command:
-        ALTITUDE angle
-
-    - Valid range: 20.0 to 91.0 degrees
-    - Timeout: 100 s
-    - States: STOPPED, MOVING, IN POSN, LIMIT, ERROR
-    - Motion simulated with constant velocity (no acceleration).
+    Simulated ALT axis.
+    Supports:
+      1. Legacy Point-to-Point (ALTITUDE command)
+      2. New Trajectory Tracking (GOTO command)
     """
 
     def __init__(self):
         super().__init__("ALT")
 
-        # --- canonical position variables expected by SubsystemBase/SCC ---
-        self.current_pos_deg = 0.0       # initial altitude
-        self.target_pos_deg = 0.0
-
-        # Legacy alias if anything still uses current_pos
-        self.current_pos = self.current_pos_deg
-
+        # --- Legacy State Variables ---
         self.state = "STOPPED"
         self.last_error = "OK"
 
-        # --- motion model parameters ---
-        self.vel_limit_deg_s = 2.0        # physical velocity (deg/sec)
-        self.sim_speed = 1.0              # 1.0 = real time, <1 slower, >1 faster
+        # --- Motion Parameters ---
+        self.vel_limit_deg_s = 2.0
+        self.sim_speed = 1.0
 
+        # --- Thread Control ---
         self._motion_thread = None
         self._motion_stop = False
+        
+        # --- NEW: Trajectory Control Flags ---
+        self.tracking_active = False
+        self.active_cmd_id = None
+        self.target_reached_flag = False
+        self.current_vel = 0.0
 
-        # --- command table (TCS sends ALTITUDE, STOP ALT) ---
+        # --- Command Table ---
         self.command_table = {
             "ALTITUDE": self._cmd_ALTITUDE,
-            "STOP":     self._cmd_STOP,    # STOP ALT
+            "STOP":     self._cmd_STOP,
+            "GOTO":     self._cmd_GOTO,# <--- RENAMED FROM TRAJECTORY
+            "GOTOF":      self._cmd_GOTO,
         }
 
-    # ------------------------------------------------------------
-    # Helper: set error condition
-    # ------------------------------------------------------------
-    def _set_error(self, code: str):
-        self.last_error = code
-        self.state = "ERROR"
+        # --- NEW: Start Physics Thread (Always runs in background) ---
+        self.physics_thread = threading.Thread(target=self._physics_loop, daemon=True)
+        self.physics_thread.start()
 
-    # ------------------------------------------------------------
-    # Helper: reject when mechanism in OFF-LINE / OVERRIDE / UNKNOWN
-    # ------------------------------------------------------------
-    def _reject_if_blocked(self):
-        if self.state in ("OFF-LINE", "OVERRIDE", "UNKNOWN"):
-            self._set_error("STATEREJECT")
-            return "STATEREJECT"
-        return None
+    # ============================================================
+    # NEW: Trajectory Command Handler (GOTO)
+    # ============================================================
+    def _cmd_GOTO(self, cmd_id, params):
+        """
+        Handles incoming JSON trajectory packets.
+        Expected params: {'timestamp': [t1...], 'position': [p1...]}
+        """
+        # 1. Stop Legacy Motion (if running)
+        self._motion_stop = True
+        if self._motion_thread and self._motion_thread.is_alive():
+            self._motion_thread.join(timeout=0.2)
+        
+        self.state = "TRACKING" # Update Status String
+        
+        # 2. Send ACK
+        self.send_result("ACK", cmd_id=cmd_id)
 
-    # ------------------------------------------------------------
-    # Motion engine
-    # ------------------------------------------------------------
+        # 3. Append Data
+        timestamps = params.get('timestamp')
+        positions = params.get('position')
+        
+        if timestamps and positions:
+            success = self.append_trajectory_data(timestamps, positions)
+            if success:
+                # 4. Activate Physics Loop
+                self.active_cmd_id = cmd_id
+                self.target_reached_flag = False 
+                self.tracking_active = True
+                log("ALT", f"GOTO (Trajectory) Mode ACTIVATED for ID {cmd_id}")
+            else:
+                self.send_result("ERROR", cmd_id=cmd_id, error="FILE_WRITE_FAIL")
+        else:
+            self.send_result("ERROR", cmd_id=cmd_id, error="BAD_DATA")
+
+    # ============================================================
+    # NEW: Physics Loop (The "Brain" for Trajectory)
+    # ============================================================
+    def _physics_loop(self):
+        log("ALT", "Physics Thread Started")
+        
+        while self.running:
+            start_time = time.time()
+            
+            # ONLY run physics if we are in Trajectory Mode
+            if self.tracking_active:
+                # 1. Get Target from Base Class
+                target = self.get_interpolated_target(start_time)
+                # If target is None (end of file), hold last known target
+                if target is not None:
+                    self.target_pos_deg = target
+                
+                if target is not None:
+                    # 2. Calculate Error
+                    error = target - self.current_pos_deg
+                    
+                    # 3. Calculate Physics (P-Control + Limits)
+                    cmd_vel = np.clip(error * 1.5, -MAX_VEL, MAX_VEL)
+                    
+                    delta_v = cmd_vel - self.current_vel
+                    delta_v = np.clip(delta_v, -MAX_ACCEL * DT, MAX_ACCEL * DT)
+                    
+                    self.current_vel += delta_v
+                    self.current_pos_deg += self.current_vel * DT
+                    
+                    # Update Legacy Alias
+                    self.current_pos = self.current_pos_deg
+
+                    # 4. Check Completion
+                    if abs(error) < TOLERANCE and not self.target_reached_flag:
+                        self.target_reached_flag = True
+                        if self.active_cmd_id:
+                            self.send_result("COMPLETED", cmd_id=self.active_cmd_id, msg="Target Reached")
+                        self.state = "TRACKING"
+
+                    # 5. Log & Report (Status Bus)
+                    self.log_current_state_to_disk(start_time, self.current_pos_deg)
+                    
+                    # Send live status packet
+                    self.send_status(cmd_id=self.active_cmd_id, error=error)
+                
+            # Timing (Maintain 10Hz)
+            elapsed = time.time() - start_time
+            time.sleep(max(0, DT - elapsed))
+
+    # ============================================================
+    # EXISTING: Legacy Motion Engine (Modified for Safety)
+    # ============================================================
     def _start_move(self, target_deg: float, timeout_s: float):
-        """
-        Start motion toward target_deg at vel_limit_deg_s.
-        Uses current_pos_deg / target_pos_deg as canonical variables.
-        """
-
+        # --- SAFETY: Disable Trajectory Mode if Legacy Move starts ---
+        self.tracking_active = False 
+        self.active_cmd_id = None
+        
         # If another motion is running → override
         if self._motion_thread and self._motion_thread.is_alive():
             self._motion_stop = True
@@ -97,7 +172,6 @@ class ALTSubsystem(SubsystemBase):
         self.sim_speed = max(self.sim_speed, 1e-6)
         t_required_sim = t_required_real / self.sim_speed
 
-        # set demand
         self.target_pos_deg = target_deg
 
         # no movement needed
@@ -116,13 +190,11 @@ class ALTSubsystem(SubsystemBase):
             self.state = "MOVING"
             t0 = time.time()
             last_t = t0
-
-            # initial status at start of motion
             self.send_status()
 
             while True:
-                if self._motion_stop or not self.running:
-                    # STOP or shutdown
+                # Check for STOP or Trajectory Override
+                if self._motion_stop or not self.running or self.tracking_active:
                     self.state = "STOPPED"
                     self.send_status()
                     return
@@ -131,7 +203,6 @@ class ALTSubsystem(SubsystemBase):
                 elapsed = now - t0
 
                 if elapsed >= t_required_sim:
-                    # snap to target
                     self.current_pos_deg = target_deg
                     self.current_pos = self.current_pos_deg
                     self.state = "IN POSN"
@@ -146,15 +217,6 @@ class ALTSubsystem(SubsystemBase):
                 self.current_pos_deg += step
                 self.current_pos = self.current_pos_deg
 
-                # clamp
-                if direction > 0 and self.current_pos_deg > target_deg:
-                    self.current_pos_deg = target_deg
-                    self.current_pos = self.current_pos_deg
-                if direction < 0 and self.current_pos_deg < target_deg:
-                    self.current_pos_deg = target_deg
-                    self.current_pos = self.current_pos_deg
-
-                # status update each step
                 self.send_status()
                 time.sleep(0.10)
 
@@ -163,92 +225,61 @@ class ALTSubsystem(SubsystemBase):
 
         return {"status": "OK", "error": "OK"}
 
-    # ------------------------------------------------------------
-    # Command handler: ALTITUDE
-    # ------------------------------------------------------------
+    # ============================================================
+    # EXISTING: Helpers & Handlers (Unchanged)
+    # ============================================================
+    def _set_error(self, code: str):
+        self.last_error = code
+        self.state = "ERROR"
+
+    def _reject_if_blocked(self):
+        if self.state in ("OFF-LINE", "OVERRIDE", "UNKNOWN"):
+            self._set_error("STATEREJECT")
+            return "STATEREJECT"
+        return None
+
     def _cmd_ALTITUDE(self, cmd_id, params):
-        """
-        Handler for command ALTITUDE.
-        TCS sends:
-            {"command": "ALTITUDE", "params": {"angle": X}}
-        """
-
-        # Immediate ACK
         self.send_result("ACK", cmd_id=cmd_id)
-
         angle_raw = params.get("angle")
         if angle_raw is None:
             self._set_error("BADPARAM")
             self.send_result("ERROR", cmd_id=cmd_id, error_code="BADPARAM")
             return
-
         try:
             angle = float(angle_raw)
         except Exception:
             self._set_error("BADPARAM")
             self.send_result("ERROR", cmd_id=cmd_id, error_code="BADPARAM")
             return
-
-        # valid range
         if angle < 20.0 or angle > 91.0:
             self.state = "LIMIT"
             self._set_error("BADRANGE")
             self.send_result("ERROR", cmd_id=cmd_id, error_code="BADRANGE")
             return
-
-        # blocked?
         block = self._reject_if_blocked()
         if block:
             self.send_result("ERROR", cmd_id=cmd_id, error_code=block)
             return
-
-        # begin motion
         res = self._start_move(angle, timeout_s=100.0)
         if res["status"] == "ERROR":
             self.send_result("ERROR", cmd_id=cmd_id, error_code=res["error"])
             return
-
         log("ALT", f"Accepted ALTITUDE move to {angle:.3f}°")
 
-    # ------------------------------------------------------------
-    # Command handler: STOP ALT
-    # ------------------------------------------------------------
     def _cmd_STOP(self, cmd_id, params):
-        """
-        Handler for STOP on ALT mechanism.
-
-        TCS sends on ALT bus:
-            {"command": "STOP", "params": {"mechanism": "ALT"}}
-        """
-
+        # Legacy STOP also disables Trajectory Mode
+        self.tracking_active = False 
+        
         mech = (params.get("mechanism") or "").upper()
         if mech not in ("", "ALT"):
             log("ALT", f"STOP received with unexpected mechanism '{mech}', treating as ALT")
-
-        # signal motion loop to halt
         self._motion_stop = True
-
-        # if no motion, just enforce STOPPED
         if not (self._motion_thread and self._motion_thread.is_alive()):
             self.state = "STOPPED"
             self.last_error = "OK"
             self.send_status()
-
-        # ACK STOP
         self.send_result("ACK", cmd_id=cmd_id)
 
-    # ------------------------------------------------------------
-    # Dispatch from SubsystemBase
-    # ------------------------------------------------------------
-    def handle_command(self, msg: dict):
-        cmd_id = msg.get("cmd_id")
-        command = (msg.get("command") or "").upper()
-        params = msg.get("params", {}) or {}
-
-        handler = self.command_table.get(command)
-        if not handler:
-            log("ALT", f"Unknown command '{command}'")
-            self.send_result("ERROR", cmd_id=cmd_id, error_code="NETUNK")
-            return
-
-        handler(cmd_id, params)
+if __name__ == "__main__":
+    sys = ALTSubsystem()
+    sys.run()
