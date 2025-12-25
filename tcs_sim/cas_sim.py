@@ -1,15 +1,12 @@
-# cas_sim.py — FINAL corrected version for TCS core
-
 import threading
 import time
 import json
-import numpy as np  # Needed for physics limits
-
+import numpy as np
 from subsystem_base import SubsystemBase
 from bus_config import log
 
 # --- CONFIGURATION ---
-MAX_VEL = 2.0       # deg/s (Matches your existing limit)
+MAX_VEL = 2.0       # deg/s
 MAX_ACCEL = 0.3     # deg/s^2
 DT = 0.1            # 10Hz Physics Loop
 TOLERANCE = 0.05    # Degrees for "Target Reached"
@@ -28,7 +25,6 @@ class CASSubsystem(SubsystemBase):
         # --- Legacy State Variables ---
         self.current_pos_deg = 0.0
         self.target_pos_deg = 0.0
-        # Sync legacy variable
         self.current_pos = self.current_pos_deg
 
         self.state = "STOPPED"
@@ -41,28 +37,26 @@ class CASSubsystem(SubsystemBase):
         # --- Thread Control ---
         self._motion_thread = None
         self._motion_stop = False
-         
-         
-        # --- PID Control State ---
-        self.prev_error = 0.0
-        self.integral_error = 0.0
         
-        # --- NEW: Trajectory Control Flags ---
+        # --- Trajectory Control Flags ---
         self.tracking_active = False
         self.active_cmd_id = None
         self.target_reached_flag = False
         self.current_vel = 0.0
+        
+        # --- PID Control State ---
+        self.prev_error = 0.0
+        self.integral_error = 0.0
 
         # --- Command Table ---
         self.command_table = {
             "CAS":        self._cmd_CAS,
             "UNWRAP_CAS": self._cmd_UNWRAP_CAS,
             "STOP":       self._cmd_STOP,
-            "GOTO":       self._cmd_GOTO,    # <--- NEW
+            "GOTO":       self._cmd_GOTO,
             "GOTOF":      self._cmd_GOTO,
         }
 
-        # --- NEW: Start Physics Thread (Always runs in background) ---
         self.physics_thread = threading.Thread(target=self._physics_loop, daemon=True)
         self.physics_thread.start()
 
@@ -72,92 +66,106 @@ class CASSubsystem(SubsystemBase):
     def _cmd_GOTO(self, cmd_id, params):
         """
         Handles incoming JSON trajectory packets.
-        Expected params: {'timestamp': [t1...], 'position': [p1...]}
+        Wipes previous data to ensure a fresh start.
         """
-        # 1. Stop Legacy Motion (if running)
+        # 1. PAUSE EVERYTHING
+        self.tracking_active = False
         self._motion_stop = True
         if self._motion_thread and self._motion_thread.is_alive():
             self._motion_thread.join(timeout=0.2)
         
-       
-        
-        # 2. Send ACK
+        self.state = "SLEWING"
         self.send_result("ACK", cmd_id=cmd_id)
 
-        # 3. Append Data
         timestamps = params.get('timestamp')
         positions = params.get('position')
-         
         
         if timestamps and positions:
+            # 2. WIPE OLD DATA (Crucial Fix)
+            self.clear_trajectory_data()
+
+            # 3. LOAD NEW DATA
             success = self.append_trajectory_data(timestamps, positions)
+            
             if success:
-                # 4. Activate Physics Loop
                 self.active_cmd_id = cmd_id
                 self.target_reached_flag = False 
-                self.tracking_active = True
-                self.unwrapping = False
-                log("AZ", f"GOTO (Trajectory) Mode ACTIVATED for ID {cmd_id}")
+                
+                # 4. RESUME TRACKING
+                self.tracking_active = True 
+                log("CAS", f"GOTO (Trajectory) Mode ACTIVATED for ID {cmd_id}")
             else:
                 self.send_result("ERROR", cmd_id=cmd_id, error="FILE_WRITE_FAIL")
         else:
             self.send_result("ERROR", cmd_id=cmd_id, error="BAD_DATA")
 
     # ============================================================
-    # NEW: Physics Loop (The "Brain" for Trajectory)
+    # NEW: Physics Loop (PID Controller)
     # ============================================================
     def _physics_loop(self):
         log("CAS", "Physics Thread Started")
         
+        # PID Constants
+        Kp = 1.5   
+        Ki = 0.02  
+        Kd = 8.0   
+
         while self.running:
             start_time = time.time()
             
-            # ONLY run physics if we are in Trajectory Mode
             if self.tracking_active:
-                # 1. Get Target from Base Class
                 target = self.get_interpolated_target(start_time)
-                # Hold last known target if data ends
-                if target is not None:
-                    self.target_pos_deg = target
                 
                 if target is not None:
-                    # 2. Calculate Error
-                    # Note: CAS usually doesn't wrap 0-360 automatically 
-                    # like AZ unless specified. We use simple linear error.
+                    self.target_pos_deg = target
+                    
+                    # 1. Calculate Error
+                    # CAS generally doesn't wrap like AZ (0-360), so simple difference
                     error = target - self.current_pos_deg
                     
-                    # 3. Calculate Physics (P-Control + Limits)
-                    cmd_vel = np.clip(error * 1.5, -MAX_VEL, MAX_VEL)
+                    # 2. PID Control
+                    # Integral
+                    self.integral_error += error * DT
+                    self.integral_error = np.clip(self.integral_error, -5.0, 5.0)
+                    
+                    # Derivative
+                    derivative = (error - self.prev_error) / DT
+                    self.prev_error = error
+
+                    # Output Velocity
+                    pid_vel = (Kp * error) + (Ki * self.integral_error) + (Kd * derivative)
+
+                    # 3. Apply Limits
+                    cmd_vel = np.clip(pid_vel, -MAX_VEL, MAX_VEL)
                     
                     delta_v = cmd_vel - self.current_vel
                     delta_v = np.clip(delta_v, -MAX_ACCEL * DT, MAX_ACCEL * DT)
                     
                     self.current_vel += delta_v
                     self.current_pos_deg += self.current_vel * DT
-                    
-                    # Update Legacy Alias
-                    self.current_pos = self.current_pos_deg
+                    self.current_pos = self.current_pos_deg 
 
                     # 4. Check Completion
-                    if abs(error) < TOLERANCE and not self.target_reached_flag:
-                        self.target_reached_flag = True
-                        if self.active_cmd_id:
-                            self.send_result("COMPLETED", cmd_id=self.active_cmd_id, msg="Target Reached")
+                    if abs(error) < TOLERANCE:
                         self.state = "TRACKING"
+                        if not self.target_reached_flag:
+                            self.target_reached_flag = True
+                            if self.active_cmd_id:
+                                self.send_result("COMPLETED", cmd_id=self.active_cmd_id, msg="Target Reached")
+                    else:
+                        self.state = "SLEWING"
 
-                    # 5. Log & Report (Status Bus)
                     self.log_current_state_to_disk(start_time, self.current_pos_deg)
                     self.send_status(cmd_id=self.active_cmd_id, error=error)
-                
-            # Timing (Maintain 10Hz)
+            
             elapsed = time.time() - start_time
             time.sleep(max(0, DT - elapsed))
 
     # ============================================================
-    # EXISTING: Legacy Motion Engine (Modified for Safety)
+    # EXISTING: Legacy Motion Engine
     # ============================================================
     def _start_move(self, target_deg, timeout_s):
-        # --- SAFETY: Disable Trajectory Mode ---
+        # Disable Trajectory
         self.tracking_active = False 
         self.active_cmd_id = None
 
@@ -191,11 +199,9 @@ class CASSubsystem(SubsystemBase):
             self.state = "MOVING"
             t0 = time.time()
             last = t0
-
             self.send_status()
 
             while True:
-                # Check for STOP or Trajectory Override
                 if self._motion_stop or not self.running or self.tracking_active:
                     self.state = "STOPPED"
                     self.send_status()
@@ -217,7 +223,6 @@ class CASSubsystem(SubsystemBase):
                 self.current_pos_deg += step
                 self.current_pos = self.current_pos_deg
 
-                # Clamp logic
                 if direction > 0 and self.current_pos_deg > target_deg:
                     self.current_pos_deg = target_deg
                 if direction < 0 and self.current_pos_deg < target_deg:
@@ -285,9 +290,7 @@ class CASSubsystem(SubsystemBase):
         log("CAS", f"UNWRAP → {target:.3f}")
 
     def _cmd_STOP(self, cmd_id, params):
-        # Legacy STOP disables Trajectory
-        self.tracking_active = False 
-        
+        self.tracking_active = False
         mech = (params.get("mechanism") or "").upper()
         if mech not in ("", "CAS"):
             log("CAS", f"STOP received with unexpected mechanism '{mech}', treating as CAS")
