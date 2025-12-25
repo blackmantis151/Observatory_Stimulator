@@ -40,6 +40,11 @@ class AZSubsystem(SubsystemBase):
         self.active_cmd_id = None
         self.target_reached_flag = False
         self.current_vel = 0.0
+        
+        
+        # --- PID Control State ---
+        self.prev_error = 0.0
+        self.integral_error = 0.0
 
         # --- Command Table ---
         self.command_table = {
@@ -67,7 +72,7 @@ class AZSubsystem(SubsystemBase):
         if self._motion_thread and self._motion_thread.is_alive():
             self._motion_thread.join(timeout=0.2)
         
-        self.state = "TRACKING" 
+       
         
         # 2. Send ACK
         self.send_result("ACK", cmd_id=cmd_id)
@@ -75,6 +80,7 @@ class AZSubsystem(SubsystemBase):
         # 3. Append Data
         timestamps = params.get('timestamp')
         positions = params.get('position')
+         
         
         if timestamps and positions:
             success = self.append_trajectory_data(timestamps, positions)
@@ -93,57 +99,82 @@ class AZSubsystem(SubsystemBase):
     # NEW: Physics Loop (The "Brain" for Trajectory)
     # ============================================================
     def _physics_loop(self):
-        log("AZ", "Physics Thread Started")
+        log(self.name, "Physics Thread Started")
         
+        # --- PID TUNING ---
+        # Kp: Pulls you to the target (Speed)
+        # Ki: Fixes tiny steady offsets (Accuracy)
+        # Kd: Predicts the future and applies brakes (Stability)
+        Kp = 1.5   
+        Ki = 0.02  
+        Kd = 8.0   # High D term prevents overshoot (braking)
+
         while self.running:
             start_time = time.time()
             
             # ONLY run physics if we are in Trajectory Mode
             if self.tracking_active:
-                # 1. Get Target from Base Class
                 target = self.get_interpolated_target(start_time)
+                
                 # Hold last known target if data ends
                 if target is not None:
                     self.target_pos_deg = target
                 
                 if target is not None:
-                    # 2. Calculate Error (With Wrap Logic)
+                    # 1. Calculate Error
                     error = target - self.current_pos_deg
                     
-                    # --- AZIMUTH WRAP LOGIC (Shortest Path) ---
-                    # If error > 180, go the other way (subtract 360)
-                    # If error < -180, go the other way (add 360)
-                    if error > 180:
-                        error -= 360
-                    elif error < -180:
-                        error += 360
+                    # (FOR AZIMUTH ONLY: Uncomment this block in az_sim.py)
+                    if error > 180: error -= 360
+                    elif error < -180: error += 360
+
+                    # 2. Calculate Integral (Sum of errors over time)
+                    # Anti-windup: Clamp integral so it doesn't grow huge
+                    self.integral_error += error * DT
+                    self.integral_error = np.clip(self.integral_error, -5.0, 5.0)
+
+                    # 3. Calculate Derivative (Rate of change of error)
+                    # If we are closing the gap fast, derivative is negative -> BRAKING
+                    derivative = (error - self.prev_error) / DT
+                    self.prev_error = error
+
+                    # 4. PID Output (This is our "Ideal Velocity")
+                    pid_vel = (Kp * error) + (Ki * self.integral_error) + (Kd * derivative)
+
+                    # 5. Apply Physics Limits (Motor capabilities)
+                    # First, clip the requested velocity to the motor's max speed
+                    target_vel = np.clip(pid_vel, -MAX_VEL, MAX_VEL)
                     
-                    # 3. Calculate Physics (P-Control + Limits)
-                    cmd_vel = np.clip(error * 1.5, -MAX_VEL, MAX_VEL)
-                    
-                    delta_v = cmd_vel - self.current_vel
+                    # Second, limit the Acceleration (Jerk)
+                    # We can't jump from 0 to 2.0 instantly. We must ramp up.
+                    delta_v = target_vel - self.current_vel
                     delta_v = np.clip(delta_v, -MAX_ACCEL * DT, MAX_ACCEL * DT)
                     
+                    # Update State
                     self.current_vel += delta_v
                     self.current_pos_deg += self.current_vel * DT
                     
-                    # Normalize Azimuth to 0-360 range for display
+                    # (FOR AZIMUTH ONLY: Uncomment in az_sim.py)
                     self.current_pos_deg = self.current_pos_deg % 360
-                    
-                    # Update Legacy Alias
+
+                    # Sync Legacy Alias
                     self.current_pos = self.current_pos_deg
 
-                    # 4. Check Completion
-                    if abs(error) < TOLERANCE and not self.target_reached_flag:
-                        self.target_reached_flag = True
-                        if self.active_cmd_id:
-                            self.send_result("COMPLETED", cmd_id=self.active_cmd_id, msg="Target Reached")
+                    # 6. State Management (Slewing vs Tracking)
+                    # Use a slightly tighter tolerance for logic, but keep existing for "Target Reached"
+                    if abs(error) < TOLERANCE:
                         self.state = "TRACKING"
+                        if not self.target_reached_flag:
+                            self.target_reached_flag = True
+                            if self.active_cmd_id:
+                                self.send_result("COMPLETED", cmd_id=self.active_cmd_id, msg="Target Reached")
+                    else:
+                        self.state = "SLEWING"
 
-                    # 5. Log & Report (Status Bus)
+                    # 7. Log & Report
                     self.log_current_state_to_disk(start_time, self.current_pos_deg)
                     self.send_status(cmd_id=self.active_cmd_id, error=error)
-                
+
             # Timing (Maintain 10Hz)
             elapsed = time.time() - start_time
             time.sleep(max(0, DT - elapsed))
