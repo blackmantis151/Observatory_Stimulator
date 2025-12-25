@@ -163,13 +163,22 @@ class SubsystemBase:
     
     # Add this inside class SubsystemBase in subsystem_base.py
     def clear_trajectory_data(self):
-        """Wipes the existing trajectory buffer."""
-        with self.data_lock: # Ensure thread safety
+        """
+        Wipes the existing trajectory buffer AND FILE.
+        CRITICAL FIX: This writes the HEADER back to the file so pandas can read it.
+        """
+        with self.data_lock:
+            # Wipe memory (if used)
             self.traj_timestamps = []
             self.traj_positions = []
-            self.traj_t_start = 0.0
-            self.traj_t_end = 0.0
-            log(self.name, "Trajectory buffer cleared.")
+            
+            # Wipe File and Re-write Header
+            try:
+                with open(self.traj_file, 'w', newline='') as f:
+                    csv.writer(f).writerow(['timestamp', 'position'])
+                log(self.name, "Trajectory file cleared and header reset.")
+            except Exception as e:
+                log(self.name, f"Error clearing trajectory file: {e}")
             
     
 
