@@ -41,6 +41,11 @@ class CASSubsystem(SubsystemBase):
         # --- Thread Control ---
         self._motion_thread = None
         self._motion_stop = False
+         
+         
+        # --- PID Control State ---
+        self.prev_error = 0.0
+        self.integral_error = 0.0
         
         # --- NEW: Trajectory Control Flags ---
         self.tracking_active = False
@@ -67,13 +72,14 @@ class CASSubsystem(SubsystemBase):
     def _cmd_GOTO(self, cmd_id, params):
         """
         Handles incoming JSON trajectory packets.
+        Expected params: {'timestamp': [t1...], 'position': [p1...]}
         """
         # 1. Stop Legacy Motion (if running)
         self._motion_stop = True
         if self._motion_thread and self._motion_thread.is_alive():
             self._motion_thread.join(timeout=0.2)
         
-        self.state = "TRACKING" 
+       
         
         # 2. Send ACK
         self.send_result("ACK", cmd_id=cmd_id)
@@ -81,6 +87,7 @@ class CASSubsystem(SubsystemBase):
         # 3. Append Data
         timestamps = params.get('timestamp')
         positions = params.get('position')
+         
         
         if timestamps and positions:
             success = self.append_trajectory_data(timestamps, positions)
@@ -89,7 +96,8 @@ class CASSubsystem(SubsystemBase):
                 self.active_cmd_id = cmd_id
                 self.target_reached_flag = False 
                 self.tracking_active = True
-                log("CAS", f"GOTO (Trajectory) Mode ACTIVATED for ID {cmd_id}")
+                self.unwrapping = False
+                log("AZ", f"GOTO (Trajectory) Mode ACTIVATED for ID {cmd_id}")
             else:
                 self.send_result("ERROR", cmd_id=cmd_id, error="FILE_WRITE_FAIL")
         else:

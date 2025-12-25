@@ -159,6 +159,19 @@ class SubsystemBase:
             log(self.name, f"Error recovering state: {e}")
         
         return default_pos
+    
+    
+    # Add this inside class SubsystemBase in subsystem_base.py
+    def clear_trajectory_data(self):
+        """Wipes the existing trajectory buffer."""
+        with self.data_lock: # Ensure thread safety
+            self.traj_timestamps = []
+            self.traj_positions = []
+            self.traj_t_start = 0.0
+            self.traj_t_end = 0.0
+            log(self.name, "Trajectory buffer cleared.")
+            
+    
 
     def append_trajectory_data(self, timestamps, positions):
         """Thread-safe method to append new trajectory packets."""

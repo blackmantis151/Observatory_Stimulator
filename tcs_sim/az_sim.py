@@ -12,6 +12,11 @@ MAX_ACCEL = 0.3     # deg/s^2
 DT = 0.1            # 10Hz Physics Loop
 TOLERANCE = 0.05    # Degrees for "Target Reached"
 
+# --- NEW: AZIMUTH LIMITS (From Documentation) ---
+L1_MAX_POS = 360.0  # Clockwise Limit
+L1_MAX_NEG = -180.0 # Anti-Clockwise Limit
+BUFFER_ZONE = 5.0   # Trigger unwrap 5 degrees before hard limit
+
 class AZSubsystem(SubsystemBase):
     """
     Simulated AZ axis.
@@ -34,6 +39,10 @@ class AZSubsystem(SubsystemBase):
         # --- Thread Control ---
         self._motion_thread = None
         self._motion_stop = False
+        
+        # --- NEW: Unwrap State ---
+        self.unwrapping = False
+        self.unwrap_target = 0.0
         
         # --- NEW: Trajectory Control Flags ---
         self.tracking_active = False
@@ -65,30 +74,44 @@ class AZSubsystem(SubsystemBase):
     def _cmd_GOTO(self, cmd_id, params):
         """
         Handles incoming JSON trajectory packets.
-        Expected params: {'timestamp': [t1...], 'position': [p1...]}
+        Wipes previous data to ensure a fresh start.
+        Params:
+          - timestamp: list of epoch times
+          - position:  list of azimuth positions (degrees)
+        1. PAUSE current tracking & motion
+        2. WIPE old trajectory data
+        3. LOAD new trajectory data
+        4. RESUME tracking mode     
         """
-        # 1. Stop Legacy Motion (if running)
-        self._motion_stop = True
+        # 1. PAUSE EVERYTHING
+        self.tracking_active = False   # <--- STOP Physics reading
+        self._motion_stop = True       # <--- STOP Legacy motion
         if self._motion_thread and self._motion_thread.is_alive():
             self._motion_thread.join(timeout=0.2)
         
-       
-        
-        # 2. Send ACK
+        self.state = "SLEWING"
         self.send_result("ACK", cmd_id=cmd_id)
 
-        # 3. Append Data
         timestamps = params.get('timestamp')
         positions = params.get('position')
-         
         
         if timestamps and positions:
+            # 2. WIPE OLD DATA (Crucial Fix)
+            self.clear_trajectory_data() 
+
+            # 3. LOAD NEW DATA
             success = self.append_trajectory_data(timestamps, positions)
+            
             if success:
-                # 4. Activate Physics Loop
                 self.active_cmd_id = cmd_id
                 self.target_reached_flag = False 
-                self.tracking_active = True
+                
+                # AZ Specific: Reset unwrap state on new command
+                self.unwrapping = False 
+                self.unwrap_target = 0.0
+                
+                # 4. RESUME TRACKING
+                self.tracking_active = True 
                 log("AZ", f"GOTO (Trajectory) Mode ACTIVATED for ID {cmd_id}")
             else:
                 self.send_result("ERROR", cmd_id=cmd_id, error="FILE_WRITE_FAIL")
@@ -102,74 +125,104 @@ class AZSubsystem(SubsystemBase):
         log(self.name, "Physics Thread Started")
         
         # --- PID TUNING ---
-        # Kp: Pulls you to the target (Speed)
-        # Ki: Fixes tiny steady offsets (Accuracy)
-        # Kd: Predicts the future and applies brakes (Stability)
         Kp = 1.5   
         Ki = 0.02  
-        Kd = 8.0   # High D term prevents overshoot (braking)
+        Kd = 8.0   
 
         while self.running:
             start_time = time.time()
             
-            # ONLY run physics if we are in Trajectory Mode
             if self.tracking_active:
-                target = self.get_interpolated_target(start_time)
                 
-                # Hold last known target if data ends
-                if target is not None:
-                    self.target_pos_deg = target
+                # --- CHANGE 1: TARGET SELECTION ---
+                # If unwrapping, ignore the trajectory file. Go to the reset point.
+                if self.unwrapping:
+                    target = self.unwrap_target
+                else:
+                    target = self.get_interpolated_target(start_time)
+                    # Hold last known target if data ends
+                    if target is not None:
+                        self.target_pos_deg = target
                 
                 if target is not None:
                     # 1. Calculate Error
                     error = target - self.current_pos_deg
                     
-                    # (FOR AZIMUTH ONLY: Uncomment this block in az_sim.py)
-                    if error > 180: error -= 360
-                    elif error < -180: error += 360
+                    # (FOR AZIMUTH ONLY) 
+                    # Only use shortest path logic if NOT unwrapping. 
+                    # When unwrapping, we want the long linear move.
+                    if not self.unwrapping:
+                        if error > 180: error -= 360
+                        elif error < -180: error += 360
 
-                    # 2. Calculate Integral (Sum of errors over time)
-                    # Anti-windup: Clamp integral so it doesn't grow huge
+                    # --- CHANGE 2: CHECK LIMITS (Trigger Unwrap) ---
+                    # If near +360 limit and trying to go higher -> Unwrap to 0
+                    if not self.unwrapping:
+                        if (self.current_pos_deg > (L1_MAX_POS - BUFFER_ZONE)) and (error > 0):
+                            log("AZ", f"Hit Limit {self.current_pos_deg:.1f}. Unwrapping -> 0")
+                            self.unwrapping = True
+                            self.state = "UNWRAPPING"
+                            self.unwrap_target = self.current_pos_deg - 360.0
+                            self.integral_error = 0 # Reset PID memory
+                            self.prev_error = 0
+                            continue 
+
+                        # If near -180 limit and trying to go lower -> Unwrap to +180
+                        elif (self.current_pos_deg < (L1_MAX_NEG + BUFFER_ZONE)) and (error < 0):
+                            log("AZ", f"Hit Limit {self.current_pos_deg:.1f}. Unwrapping -> +180")
+                            self.unwrapping = True
+                            self.state = "UNWRAPPING"
+                            self.unwrap_target = self.current_pos_deg + 360.0
+                            self.integral_error = 0 
+                            self.prev_error = 0
+                            continue
+
+                    # 2. Calculate Integral
                     self.integral_error += error * DT
                     self.integral_error = np.clip(self.integral_error, -5.0, 5.0)
 
-                    # 3. Calculate Derivative (Rate of change of error)
-                    # If we are closing the gap fast, derivative is negative -> BRAKING
+                    # 3. Calculate Derivative
                     derivative = (error - self.prev_error) / DT
                     self.prev_error = error
 
-                    # 4. PID Output (This is our "Ideal Velocity")
-                    pid_vel = (Kp * error) + (Ki * self.integral_error) + (Kd * derivative)
+                    # 4. PID Output
+                    # If unwrapping, use aggressive P-only for speed
+                    if self.unwrapping:
+                         pid_vel = error * 2.0 
+                    else:
+                         pid_vel = (Kp * error) + (Ki * self.integral_error) + (Kd * derivative)
 
-                    # 5. Apply Physics Limits (Motor capabilities)
-                    # First, clip the requested velocity to the motor's max speed
+                    # 5. Apply Physics Limits
                     target_vel = np.clip(pid_vel, -MAX_VEL, MAX_VEL)
                     
-                    # Second, limit the Acceleration (Jerk)
-                    # We can't jump from 0 to 2.0 instantly. We must ramp up.
                     delta_v = target_vel - self.current_vel
                     delta_v = np.clip(delta_v, -MAX_ACCEL * DT, MAX_ACCEL * DT)
                     
-                    # Update State
                     self.current_vel += delta_v
                     self.current_pos_deg += self.current_vel * DT
                     
-                    # (FOR AZIMUTH ONLY: Uncomment in az_sim.py)
-                    self.current_pos_deg = self.current_pos_deg % 360
+                    # NOTE: Removed "current_pos_deg % 360". 
+                    # We must allow negative values (e.g. -170) for the -180 limit to work.
 
-                    # Sync Legacy Alias
                     self.current_pos = self.current_pos_deg
 
-                    # 6. State Management (Slewing vs Tracking)
-                    # Use a slightly tighter tolerance for logic, but keep existing for "Target Reached"
-                    if abs(error) < TOLERANCE:
-                        self.state = "TRACKING"
-                        if not self.target_reached_flag:
-                            self.target_reached_flag = True
-                            if self.active_cmd_id:
-                                self.send_result("COMPLETED", cmd_id=self.active_cmd_id, msg="Target Reached")
+                    # --- CHANGE 3: STATE MANAGEMENT & UNWRAP EXIT ---
+                    if self.unwrapping:
+                        # Exit unwrap state if we reached the target
+                        if abs(self.current_pos_deg - self.unwrap_target) < TOLERANCE:
+                            log("AZ", "Unwrap Complete. Resuming Tracking.")
+                            self.unwrapping = False
+                            self.state = "SLEWING"
                     else:
-                        self.state = "SLEWING"
+                        # Standard Tracking Check
+                        if abs(error) < TOLERANCE:
+                            self.state = "TRACKING"
+                            if not self.target_reached_flag:
+                                self.target_reached_flag = True
+                                if self.active_cmd_id:
+                                    self.send_result("COMPLETED", cmd_id=self.active_cmd_id, msg="Target Reached")
+                        else:
+                            self.state = "SLEWING"
 
                     # 7. Log & Report
                     self.log_current_state_to_disk(start_time, self.current_pos_deg)
