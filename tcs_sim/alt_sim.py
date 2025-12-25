@@ -40,7 +40,12 @@ class ALTSubsystem(SubsystemBase):
         self.active_cmd_id = None
         self.target_reached_flag = False
         self.current_vel = 0.0
-
+         
+         
+        # --- PID Control State ---
+        self.prev_error = 0.0
+        self.integral_error = 0.0
+        
         # --- Command Table ---
         self.command_table = {
             "ALTITUDE": self._cmd_ALTITUDE,
@@ -74,6 +79,7 @@ class ALTSubsystem(SubsystemBase):
         # 3. Append Data
         timestamps = params.get('timestamp')
         positions = params.get('position')
+        self.state = "SLEWING"
         
         if timestamps and positions:
             success = self.append_trajectory_data(timestamps, positions)
@@ -92,8 +98,13 @@ class ALTSubsystem(SubsystemBase):
     # NEW: Physics Loop (The "Brain" for Trajectory)
     # ============================================================
     def _physics_loop(self):
-        log("ALT", "Physics Thread Started")
-        
+        log("ALT", "Physics Thread Started") # Change "ALT" to self.name for other files
+
+        # PID Constants (Tune these if needed)
+        Kp = 1.5   # Proportional (Speed)
+        Ki = 0.02  # Integral (Accuracy / Offset fix)
+        Kd = 8.0   # Derivative (Damping / Stability)
+
         while self.running:
             start_time = time.time()
             
@@ -109,24 +120,52 @@ class ALTSubsystem(SubsystemBase):
                     # 2. Calculate Error
                     error = target - self.current_pos_deg
                     
-                    # 3. Calculate Physics (P-Control + Limits)
-                    cmd_vel = np.clip(error * 1.5, -MAX_VEL, MAX_VEL)
+                    # (For AZIMUTH only: Add wrap logic here)
+                    # if error > 180: error -= 360
+                    # elif error < -180: error += 360
                     
+                    # 3. Calculate Physics (PID Control + Limits)
+                    
+                    # A. Integral Term (Accumulate error over time)
+                    # We clamp it to prevent "Integral Windup" (getting stuck at huge values)
+                    self.integral_error += error * DT
+                    self.integral_error = np.clip(self.integral_error, -5.0, 5.0)
+
+                    # B. Derivative Term (Rate of change of error)
+                    derivative = (error - self.prev_error) / DT
+                    self.prev_error = error
+
+                    # C. PID Output (Desired Velocity)
+                    pid_vel = (Kp * error) + (Ki * self.integral_error) + (Kd * derivative)
+
+                    # D. Apply Limits
+                    # 1. Limit Velocity
+                    cmd_vel = np.clip(pid_vel, -MAX_VEL, MAX_VEL)
+                    
+                    # 2. Limit Acceleration (Ramp up/down)
                     delta_v = cmd_vel - self.current_vel
                     delta_v = np.clip(delta_v, -MAX_ACCEL * DT, MAX_ACCEL * DT)
                     
                     self.current_vel += delta_v
                     self.current_pos_deg += self.current_vel * DT
                     
+                    # (For AZIMUTH only: Normalize angle)
+                    # self.current_pos_deg %= 360
+
                     # Update Legacy Alias
                     self.current_pos = self.current_pos_deg
+                    
 
                     # 4. Check Completion
-                    if abs(error) < TOLERANCE and not self.target_reached_flag:
-                        self.target_reached_flag = True
-                        if self.active_cmd_id:
-                            self.send_result("COMPLETED", cmd_id=self.active_cmd_id, msg="Target Reached")
+                    # Use slightly tighter logic for state switching if desired
+                    if abs(error) < TOLERANCE:
                         self.state = "TRACKING"
+                        if not self.target_reached_flag:
+                            self.target_reached_flag = True
+                            if self.active_cmd_id:
+                                self.send_result("COMPLETED", cmd_id=self.active_cmd_id, msg="Target Reached")
+                    else:
+                        self.state = "SLEWING"
 
                     # 5. Log & Report (Status Bus)
                     self.log_current_state_to_disk(start_time, self.current_pos_deg)
@@ -137,7 +176,6 @@ class ALTSubsystem(SubsystemBase):
             # Timing (Maintain 10Hz)
             elapsed = time.time() - start_time
             time.sleep(max(0, DT - elapsed))
-
     # ============================================================
     # EXISTING: Legacy Motion Engine (Modified for Safety)
     # ============================================================
