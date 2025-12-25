@@ -65,34 +65,47 @@ class ALTSubsystem(SubsystemBase):
         """
         Handles incoming JSON trajectory packets.
         Expected params: {'timestamp': [t1...], 'position': [p1...]}
+        Activates the physics loop to start tracking.
+        1. Stops any legacy motion in progress.
+        2. Sends ACK.
+        3. Appends trajectory data to CSV.
+        4. Activates physics loop tracking mode.
+        5. Sends COMPLETED when target reached.
+        6. Sends STATUS updates during tracking.
+        7. Logs position to disk.
         """
-        # 1. Stop Legacy Motion (if running)
-        self._motion_stop = True
+        # 1. PAUSE EVERYTHING
+        self.tracking_active = False   # <--- STOP Physics reading
+        self._motion_stop = True       # <--- STOP Legacy motion
         if self._motion_thread and self._motion_thread.is_alive():
             self._motion_thread.join(timeout=0.2)
         
-        self.state = "TRACKING" # Update Status String
-        
-        # 2. Send ACK
+        self.state = "SLEWING"
         self.send_result("ACK", cmd_id=cmd_id)
 
-        # 3. Append Data
         timestamps = params.get('timestamp')
         positions = params.get('position')
-        self.state = "SLEWING"
         
         if timestamps and positions:
+            # 2. WIPE OLD DATA (Crucial Fix)
+            self.clear_trajectory_data() 
+
+            # 3. LOAD NEW DATA
             success = self.append_trajectory_data(timestamps, positions)
+            
             if success:
-                # 4. Activate Physics Loop
                 self.active_cmd_id = cmd_id
                 self.target_reached_flag = False 
-                self.tracking_active = True
-                log("ALT", f"GOTO (Trajectory) Mode ACTIVATED for ID {cmd_id}")
+                self.unwrapping = False
+                
+                # 4. RESUME TRACKING
+                self.tracking_active = True 
+                log(self.name, f"GOTO (Trajectory) Mode ACTIVATED for ID {cmd_id}")
             else:
                 self.send_result("ERROR", cmd_id=cmd_id, error="FILE_WRITE_FAIL")
         else:
             self.send_result("ERROR", cmd_id=cmd_id, error="BAD_DATA")
+
 
     # ============================================================
     # NEW: Physics Loop (The "Brain" for Trajectory)
