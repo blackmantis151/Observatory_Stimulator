@@ -1,4 +1,4 @@
-# Observatory Stimulator
+# Observatory Simulator
 
 Simulates the TCS motors and subsystems over ZeroMQ.  
 When TCS fires a packet, the stimulator dispatches it to a command‐specific handler, simulates the mechanical response over time, and sends back status/feedback.
